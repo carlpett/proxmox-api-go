@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -193,6 +195,78 @@ func (c *Client) GetVmSpiceProxy(vmr *VmRef) (vmSpiceProxy map[string]interface{
 	return
 }
 
+type AgentNetworkInterface struct {
+	MACAddress  string
+	IPAddresses []net.IP
+	Name        string
+	Statistics  map[string]int64
+}
+
+func (a *AgentNetworkInterface) UnmarshalJSON(b []byte) error {
+	var intermediate struct {
+		HardwareAddress string `json:"hardware-address"`
+		IPAddresses     []struct {
+			IPAddress     string `json:"ip-address"`
+			IPAddressType string `json:"ip-address-type"`
+			Prefix        int    `json:"prefix"`
+		} `json:"ip-addresses"`
+		Name       string           `json:"name"`
+		Statistics map[string]int64 `json:"statistics"`
+	}
+	err := json.Unmarshal(b, &intermediate)
+	if err != nil {
+		return err
+	}
+
+	a.IPAddresses = make([]net.IP, len(intermediate.IPAddresses))
+	for idx, ip := range intermediate.IPAddresses {
+		a.IPAddresses[idx] = net.ParseIP(ip.IPAddress)
+		if a.IPAddresses[idx] == nil {
+			return fmt.Errorf("Could not parse %s as IP", ip.IPAddress)
+		}
+	}
+	a.MACAddress = intermediate.HardwareAddress
+	a.Name = intermediate.Name
+	a.Statistics = intermediate.Statistics
+	return nil
+}
+
+func (c *Client) GetVmAgentNetworkInterfaces(vmr *VmRef) ([]AgentNetworkInterface, error) {
+	var ifs []AgentNetworkInterface
+	err := c.doAgentGet(vmr, "network-get-interfaces", &ifs)
+	return ifs, err
+}
+
+func (c *Client) doAgentGet(vmr *VmRef, command string, output interface{}) error {
+	err := c.CheckVmRef(vmr)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("/nodes/%s/%s/%d/agent/%s", vmr.node, vmr.vmType, vmr.vmId, command)
+	resp, err := c.session.Get(url, nil, nil)
+	if err != nil {
+		return err
+	}
+
+	return TypedResponse(resp, output)
+}
+
+func (c *Client) CreateTemplate(vmr *VmRef) error {
+	err := c.CheckVmRef(vmr)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("/nodes/%s/%s/%d/template", vmr.node, vmr.vmType, vmr.vmId)
+	_, err = c.session.Post(url, nil, nil, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (c *Client) MonitorCmd(vmr *VmRef, command string) (monitorRes map[string]interface{}, err error) {
 	err = c.CheckVmRef(vmr)
 	if err != nil {
@@ -201,7 +275,7 @@ func (c *Client) MonitorCmd(vmr *VmRef, command string) (monitorRes map[string]i
 	reqbody := ParamsToBody(map[string]interface{}{"command": command})
 	url := fmt.Sprintf("/nodes/%s/%s/%d/monitor", vmr.node, vmr.vmType, vmr.vmId)
 	resp, err := c.session.Post(url, nil, nil, &reqbody)
-	monitorRes = ResponseJSON(resp)
+	monitorRes, err = ResponseJSON(resp)
 	return
 }
 
@@ -306,29 +380,37 @@ func (c *Client) DeleteVm(vmr *VmRef) (exitStatus string, err error) {
 }
 
 func (c *Client) CreateQemuVm(node string, vmParams map[string]interface{}) (exitStatus string, err error) {
-
 	// Create VM disks first to ensure disks names.
 	createdDisks, createdDisksErr := c.createVMDisks(node, vmParams)
 	if createdDisksErr != nil {
 		return "", createdDisksErr
+	}
 
-		// Then create the VM itself.
-	} else if err == nil {
-		reqbody := ParamsToBody(vmParams)
-		url := fmt.Sprintf("/nodes/%s/qemu", node)
-		resp, err := c.session.Post(url, nil, nil, &reqbody)
-		if err == nil {
-			taskResponse := ResponseJSON(resp)
-			exitStatus, err = c.WaitForCompletion(taskResponse)
-			// Delete VM disks if the VM didn't create.
-			if exitStatus != "OK" {
-				deleteDisksErr := c.DeleteVMDisks(node, createdDisks)
-				if deleteDisksErr != nil {
-					return "", deleteDisksErr
-				}
-			}
+	// Then create the VM itself.
+	reqbody := ParamsToBody(vmParams)
+	url := fmt.Sprintf("/nodes/%s/qemu", node)
+	var resp *http.Response
+	resp, err = c.session.Post(url, nil, nil, &reqbody)
+	defer resp.Body.Close()
+	if err != nil {
+		b, _ := ioutil.ReadAll(resp.Body)
+		exitStatus = string(b)
+		return
+	}
+
+	taskResponse, err := ResponseJSON(resp)
+	if err != nil {
+		return
+	}
+	exitStatus, err = c.WaitForCompletion(taskResponse)
+	// Delete VM disks if the VM didn't create.
+	if exitStatus != "OK" {
+		deleteDisksErr := c.DeleteVMDisks(node, createdDisks)
+		if deleteDisksErr != nil {
+			return "", deleteDisksErr
 		}
 	}
+
 	return
 }
 
@@ -337,7 +419,10 @@ func (c *Client) CloneQemuVm(vmr *VmRef, vmParams map[string]interface{}) (exitS
 	url := fmt.Sprintf("/nodes/%s/qemu/%d/clone", vmr.node, vmr.vmId)
 	resp, err := c.session.Post(url, nil, nil, &reqbody)
 	if err == nil {
-		taskResponse := ResponseJSON(resp)
+		taskResponse, err := ResponseJSON(resp)
+		if err != nil {
+			return "", err
+		}
 		exitStatus, err = c.WaitForCompletion(taskResponse)
 	}
 	return
@@ -361,7 +446,10 @@ func (c *Client) SetVmConfig(vmr *VmRef, vmParams map[string]interface{}) (exitS
 	url := fmt.Sprintf("/nodes/%s/%s/%d/config", vmr.node, vmr.vmType, vmr.vmId)
 	resp, err := c.session.Post(url, nil, nil, &reqbody)
 	if err == nil {
-		taskResponse := ResponseJSON(resp)
+		taskResponse, err := ResponseJSON(resp)
+		if err != nil {
+			return nil, err
+		}
 		exitStatus, err = c.WaitForCompletion(taskResponse)
 	}
 	return
@@ -379,7 +467,10 @@ func (c *Client) ResizeQemuDisk(vmr *VmRef, disk string, moreSizeGB int) (exitSt
 	url := fmt.Sprintf("/nodes/%s/%s/%d/resize", vmr.node, vmr.vmType, vmr.vmId)
 	resp, err := c.session.Put(url, nil, nil, &reqbody)
 	if err == nil {
-		taskResponse := ResponseJSON(resp)
+		taskResponse, err := ResponseJSON(resp)
+		if err != nil {
+			return nil, err
+		}
 		exitStatus, err = c.WaitForCompletion(taskResponse)
 	}
 	return
@@ -420,7 +511,10 @@ func (c *Client) CreateVMDisk(
 	url := fmt.Sprintf("/nodes/%s/storage/%s/content", nodeName, storageName)
 	resp, err := c.session.Post(url, nil, nil, &reqbody)
 	if err == nil {
-		taskResponse := ResponseJSON(resp)
+		taskResponse, err := ResponseJSON(resp)
+		if err != nil {
+			return err
+		}
 		if diskName, containsData := taskResponse["data"]; !containsData || diskName != fullDiskName {
 			return errors.New(fmt.Sprintf("Cannot create VM disk %s", fullDiskName))
 		}
